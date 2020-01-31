@@ -108,14 +108,21 @@
 extern crate crypto;
 extern crate rand;
 
-#[cfg(test)] mod tests;
+pub mod aes_mode;
+#[cfg(test)]
+mod tests;
 
-use std::io::{Read, Write, Seek, SeekFrom, Result, Error, ErrorKind};
+use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom, Write};
 
-use crypto::symmetriccipher::{BlockDecryptor, BlockEncryptor, Encryptor, Decryptor};
-use crypto::blockmodes::{PkcsPadding, CbcEncryptor, CbcDecryptor, EncPadding, DecPadding};
-use crypto::buffer::{RefReadBuffer, RefWriteBuffer, BufferResult, WriteBuffer, ReadBuffer};
+use crypto::blockmodes::{
+    CbcDecryptor, CbcEncryptor, DecPadding, EcbDecryptor, EcbEncryptor, EncPadding,
+    PaddingProcessor, PkcsPadding,
+};
+use crypto::buffer::{BufferResult, ReadBuffer, RefReadBuffer, RefWriteBuffer, WriteBuffer};
+use crypto::symmetriccipher::{BlockDecryptor, BlockEncryptor, Decryptor, Encryptor};
 use rand::{OsRng, Rng};
+
+pub use aes_mode::*;
 
 const BUFFER_SIZE: usize = 8192;
 
@@ -234,16 +241,19 @@ impl<E: BlockEncryptor, W: Write> AesWriter<E, W> {
         let mut out = [0u8; BUFFER_SIZE];
         let mut write_buf = RefWriteBuffer::new(&mut out);
         loop {
-            let res = self.enc.encrypt(&mut read_buf, &mut write_buf, eof)
+            let res = self
+                .enc
+                .encrypt(&mut read_buf, &mut write_buf, eof)
                 .map_err(|e| Error::new(ErrorKind::Other, format!("encryption error: {:?}", e)))?;
             let mut enc = write_buf.take_read_buffer();
             let enc = enc.take_remaining();
             self.writer.as_mut().unwrap().write_all(enc)?;
             match res {
                 BufferResult::BufferUnderflow => break,
-                BufferResult::BufferOverflow if eof =>
-                    panic!("read_buf underflow during encryption with eof"),
-                BufferResult::BufferOverflow => {},
+                BufferResult::BufferOverflow if eof => {
+                    panic!("read_buf underflow during encryption with eof")
+                }
+                BufferResult::BufferOverflow => {}
             }
         }
         // CbcEncryptor has its own internal buffer and always consumes all input
@@ -349,11 +359,11 @@ impl<E: BlockEncryptor, W: Write> Drop for AesWriter<E, W> {
 /// # }
 /// # fn main() { let _ = foo(); }
 /// ```
-pub struct AesReader<D: BlockDecryptor, R: Read> {
+pub struct AesReader<D: AesMode + Decryptor, R: Read> {
     /// Reader to read encrypted data from
     reader: R,
     /// Decryptor to decrypt data with
-    dec: CbcDecryptor<D, DecPadding<PkcsPadding>>,
+    dec: D,
     /// Block size of BlockDecryptor, needed when seeking to correctly seek to the nearest block
     block_size: usize,
     /// Buffer used to store blob needed to find out if we reached eof
@@ -362,7 +372,7 @@ pub struct AesReader<D: BlockDecryptor, R: Read> {
     eof: bool,
 }
 
-impl<D: BlockDecryptor, R: Read> AesReader<D, R> {
+impl<D: AesMode + Decryptor, R: Read> AesReader<D, R> {
     /// Creates a new AesReader.
     ///
     /// Assumes that the first block of given reader is the IV.
@@ -394,13 +404,11 @@ impl<D: BlockDecryptor, R: Read> AesReader<D, R> {
     /// ```
     ///
     /// [bd]: https://docs.rs/rust-crypto/0.2.36/crypto/symmetriccipher/trait.BlockDecryptor.html
-    pub fn new(mut reader: R, dec: D) -> Result<AesReader<D, R>> {
-        let mut iv = vec![0u8; dec.block_size()];
-        reader.read_exact(&mut iv)?;
+    pub fn new(reader: R, dec: D, block_size: usize) -> Result<AesReader<D, R>> {
         Ok(AesReader {
-            reader: reader,
-            block_size: dec.block_size(),
-            dec: CbcDecryptor::new(dec, PkcsPadding, iv),
+            reader,
+            block_size,
+            dec,
             buffer: Vec::new(),
             eof: false,
         })
@@ -443,7 +451,9 @@ impl<D: BlockDecryptor, R: Read> AesReader<D, R> {
             let mut read_buf = RefReadBuffer::new(&self.buffer);
 
             // test if CbcDecryptor still has enough decrypted data or we have enough buffered
-            res = self.dec.decrypt(&mut read_buf, &mut write_buf, self.eof)
+            res = self
+                .dec
+                .decrypt(&mut read_buf, &mut write_buf, self.eof)
                 .map_err(|e| Error::new(ErrorKind::Other, format!("decryption error: {:?}", e)))?;
             remaining = read_buf.remaining();
         }
@@ -468,8 +478,11 @@ impl<D: BlockDecryptor, R: Read> AesReader<D, R> {
             let remaining;
             {
                 let mut read_buf = RefReadBuffer::new(&self.buffer);
-                self.dec.decrypt(&mut read_buf, &mut write_buf, self.eof)
-                    .map_err(|e| Error::new(ErrorKind::Other, format!("decryption error: {:?}", e)))?;
+                self.dec
+                    .decrypt(&mut read_buf, &mut write_buf, self.eof)
+                    .map_err(|e| {
+                        Error::new(ErrorKind::Other, format!("decryption error: {:?}", e))
+                    })?;
                 let mut dec = write_buf.take_read_buffer();
                 let dec = dec.take_remaining();
                 dec_len = dec.len();
@@ -483,15 +496,15 @@ impl<D: BlockDecryptor, R: Read> AesReader<D, R> {
         }
         Ok(dec_len)
     }
-
 }
-impl<D: BlockDecryptor, R: Read + Seek> AesReader<D, R> {
+impl<D: AesMode + Decryptor, R: Read + Seek> AesReader<D, R> {
     /// Seeks to *offset* from the start of the file
     fn seek_from_start(&mut self, offset: u64) -> Result<u64> {
         let block_num = offset / self.block_size as u64;
         let block_offset = offset % self.block_size as u64;
         // reset CbcDecryptor
-        self.reader.seek(SeekFrom::Start((block_num - 1) * self.block_size as u64))?;
+        self.reader
+            .seek(SeekFrom::Start((block_num - 1) * self.block_size as u64))?;
         let mut iv = vec![0u8; self.block_size];
         self.reader.read_exact(&mut iv)?;
         self.dec.reset(&iv);
@@ -504,7 +517,7 @@ impl<D: BlockDecryptor, R: Read + Seek> AesReader<D, R> {
     }
 }
 
-impl<D: BlockDecryptor, R: Read> Read for AesReader<D, R> {
+impl<D: AesMode + Decryptor, R: Read> Read for AesReader<D, R> {
     /// Reads encrypted data from the underlying reader, decrypts it and writes the result into the
     /// passed buffer.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -513,7 +526,7 @@ impl<D: BlockDecryptor, R: Read> Read for AesReader<D, R> {
     }
 }
 
-impl<D: BlockDecryptor, R: Read + Seek> Seek for AesReader<D, R> {
+impl<D: AesMode + Decryptor, R: Read + Seek> Seek for AesReader<D, R> {
     /// Seek to an offset, in bytes, in a stream.
     /// [Read more](https://doc.rust-lang.org/nightly/std/io/trait.Seek.html#tymethod.seek)
     ///
@@ -524,11 +537,11 @@ impl<D: BlockDecryptor, R: Read + Seek> Seek for AesReader<D, R> {
             SeekFrom::Start(offset) => {
                 // +16 because first block is the iv
                 self.seek_from_start(offset + 16)
-            },
+            }
             SeekFrom::End(_) | SeekFrom::Current(_) => {
                 let pos = self.reader.seek(pos)?;
                 self.seek_from_start(pos)
-            },
+            }
         }
     }
 }
